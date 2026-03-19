@@ -1,0 +1,2076 @@
+import binascii
+import html
+import json
+import logging
+import os
+import re
+import socket
+import ssl
+import subprocess
+import tempfile
+import threading
+import time
+import uuid
+from base64 import b64decode, b64encode, urlsafe_b64decode, urlsafe_b64encode
+from hashlib import pbkdf2_hmac, sha256
+from hmac import new as hmac_new
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote, urlparse
+
+
+APP_NAME = os.environ.get("APP_NAME", "app")
+APP_PORT = int(os.environ.get("APP_PORT", "80"))
+AWS_REGION = os.environ["AWS_REGION"]
+DB_HOST = os.environ["DB_HOST"]
+DB_PORT = int(os.environ.get("DB_PORT", "5432"))
+DB_NAME = os.environ["DB_NAME"]
+DB_USERNAME = os.environ["DB_USERNAME"]
+DB_SECRET_ARN = os.environ["DB_SECRET_ARN"]
+AUTH_SECRET_ARN = os.environ["AUTH_SECRET_ARN"]
+DB_TLS_VERIFY = os.environ.get("DB_TLS_VERIFY", "false").lower() == "true"
+REDIS_HOST = os.environ.get("REDIS_HOST", "")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_TLS_ENABLED = os.environ.get("REDIS_TLS_ENABLED", "false").lower() == "true"
+REDIS_AUTH_TOKEN_SECRET_ARN = os.environ.get("REDIS_AUTH_TOKEN_SECRET_ARN", "")
+MEDIA_BUCKET_NAME = os.environ.get("MEDIA_BUCKET_NAME", "")
+MEDIA_BASE_URL = os.environ.get("MEDIA_BASE_URL", "")
+MEDIA_UPLOAD_MAX_BYTES = int(os.environ.get("MEDIA_UPLOAD_MAX_BYTES", str(5 * 1024 * 1024)))
+REFRESH_INTERVAL_SECONDS = max(60, int(os.environ.get("APP_SECRET_REFRESH_INTERVAL_SECONDS", "300")))
+MAX_SUMMARY_LENGTH = 280
+MAX_CONTENT_LENGTH = 12000
+MAX_COMMENT_LENGTH = 2000
+TOKEN_TTL_SECONDS = 24 * 60 * 60
+ALLOWED_IMAGE_CONTENT_TYPES = {
+  "image/gif": ".gif",
+  "image/jpeg": ".jpg",
+  "image/png": ".png",
+  "image/webp": ".webp",
+}
+
+logging.basicConfig(
+    level=os.environ.get("APP_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+LOGGER = logging.getLogger(APP_NAME)
+
+STATE_LOCK = threading.Lock()
+STATE = {
+    "db_password": None,
+    "admin_username": None,
+    "admin_password": None,
+    "token_secret": None,
+    "db_password_loaded": False,
+    "auth_loaded": False,
+    "redis_auth_loaded": False,
+    "db_connectivity_ok": False,
+    "redis_connectivity_ok": False,
+    "last_refresh_epoch": None,
+    "last_refresh_error": None,
+}
+
+APPLICATION_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Marmil Blog Admin</title>
+  <style>
+    :root {
+      --ink: #172033;
+      --muted: #5f6b7a;
+      --paper: #fffdf7;
+      --panel: rgba(255, 255, 255, 0.92);
+      --accent: #b45309;
+      --accent-soft: #f59e0b;
+      --line: #e9ddc7;
+      --good: #166534;
+      --danger: #b91c1c;
+      --shadow: 0 25px 60px rgba(86, 52, 11, 0.15);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Georgia, "Times New Roman", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(245, 158, 11, 0.20), transparent 28%),
+        linear-gradient(160deg, #fff8eb 0%, #fffdf7 52%, #f6efe4 100%);
+    }
+    .shell {
+      width: min(1180px, calc(100vw - 28px));
+      margin: 24px auto 40px;
+      display: grid;
+      gap: 22px;
+    }
+    .hero,
+    .panel,
+    .post-card,
+    .comment-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+    .hero {
+      padding: 30px;
+      display: grid;
+      gap: 16px;
+    }
+    .eyebrow {
+      font-size: 13px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(2.4rem, 5vw, 4.6rem);
+      line-height: 0.92;
+      max-width: 10ch;
+    }
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 64ch;
+      font-size: 1.05rem;
+      line-height: 1.65;
+    }
+    .status-row,
+    .actions,
+    .inline-form,
+    .toolbar,
+    .comment-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .pill,
+    .tag,
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      padding: 9px 13px;
+      border: 1px solid var(--line);
+      background: white;
+      font-size: 0.92rem;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: #d1d5db;
+    }
+    .dot.good { background: #16a34a; }
+    .dot.bad { background: #dc2626; }
+    .layout {
+      display: grid;
+      gap: 22px;
+      grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+      align-items: start;
+    }
+    .stack {
+      display: grid;
+      gap: 22px;
+    }
+    .stack.compact {
+      gap: 12px;
+    }
+    .panel {
+      padding: 22px;
+    }
+    .panel h2,
+    .post-card h2,
+    .post-card h3 {
+      margin: 0 0 12px;
+    }
+    .muted {
+      color: var(--muted);
+      font-size: 0.95rem;
+      line-height: 1.55;
+    }
+    form {
+      display: grid;
+      gap: 12px;
+    }
+    label {
+      display: grid;
+      gap: 6px;
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    input,
+    textarea {
+      width: 100%;
+      border: 1px solid #d8c6a6;
+      border-radius: 16px;
+      padding: 12px 14px;
+      font: inherit;
+      color: var(--ink);
+      background: rgba(255, 252, 247, 0.92);
+    }
+    textarea {
+      min-height: 120px;
+      resize: vertical;
+    }
+    .grid-2 {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .check {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-weight: 600;
+    }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 18px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 120ms ease, opacity 120ms ease;
+    }
+    button:hover { transform: translateY(-1px); }
+    button.primary { background: var(--accent); color: white; }
+    button.secondary { background: #f6ead7; color: #8a4707; }
+    button.danger { background: #fee2e2; color: var(--danger); }
+    .message {
+      padding: 12px 14px;
+      border-radius: 16px;
+      font-size: 0.94rem;
+    }
+    .message.info { background: #eff6ff; color: #1d4ed8; }
+    .message.error { background: #fef2f2; color: var(--danger); }
+    .nav-link {
+      color: var(--accent);
+      font-weight: 700;
+      text-decoration: none;
+    }
+    .posts {
+      display: grid;
+      gap: 18px;
+    }
+    .post-card {
+      overflow: hidden;
+    }
+    .post-cover {
+      width: 100%;
+      aspect-ratio: 16 / 6;
+      object-fit: cover;
+      display: block;
+      background: linear-gradient(135deg, #fbbf24, #fef3c7);
+    }
+    .post-body {
+      padding: 22px;
+      display: grid;
+      gap: 16px;
+    }
+    .post-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .tag {
+      padding: 7px 11px;
+      background: #fffbeb;
+      color: #9a5b0b;
+    }
+    .badge.published {
+      background: #dcfce7;
+      color: var(--good);
+    }
+    .badge.draft {
+      background: #fef3c7;
+      color: #92400e;
+    }
+    .post-content {
+      white-space: pre-wrap;
+      line-height: 1.7;
+      color: #2d3748;
+    }
+    .comments {
+      display: grid;
+      gap: 12px;
+    }
+    .comment-card {
+      padding: 16px;
+    }
+    .comment-card p {
+      margin: 8px 0 0;
+      white-space: pre-wrap;
+      color: #374151;
+    }
+    .empty {
+      padding: 28px;
+      text-align: center;
+      border: 1px dashed #d8c6a6;
+      border-radius: 20px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.75);
+    }
+    .helper {
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.5;
+    }
+    @media (max-width: 920px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+      .grid-2 {
+        grid-template-columns: 1fr;
+      }
+      .shell {
+        width: min(100vw - 16px, 1180px);
+        margin: 16px auto 28px;
+      }
+      .hero,
+      .panel,
+      .post-card,
+      .comment-card {
+        border-radius: 20px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div class="eyebrow">Marmil Publishing</div>
+      <h1>Editorial control for a multi-page blog.</h1>
+      <p>Use this page to sign in, upload media to S3, manage published and draft posts, and moderate comments. The public site lives at the home page and individual post URLs.</p>
+      <div class="actions">
+        <a class="nav-link" href="/">View public site</a>
+      </div>
+      <div id="status" class="status-row"></div>
+      <div id="message"></div>
+    </section>
+
+    <section class="layout">
+      <section class="stack">
+        <section class="panel">
+          <h2>Admin Access</h2>
+          <p class="muted">Admin credentials are stored in AWS Secrets Manager. Sign in to manage drafts and comments.</p>
+          <form id="login-form">
+            <label>
+              Username
+              <input id="login-username" type="text" placeholder="admin">
+            </label>
+            <label>
+              Password
+              <input id="login-password" type="password" placeholder="Enter the Secrets Manager password">
+            </label>
+            <div class="actions">
+              <button class="primary" type="submit">Sign in</button>
+              <button class="secondary" type="button" id="logout-button">Sign out</button>
+            </div>
+          </form>
+          <div id="auth-state" class="muted"></div>
+        </section>
+
+        <section class="panel" id="editor-panel" style="display:none;">
+          <h2>Post Editor</h2>
+          <form id="post-form">
+            <input id="post-id" type="hidden" value="">
+            <label>
+              Title
+              <input id="post-title" type="text" maxlength="160" required>
+            </label>
+            <div class="grid-2">
+              <label>
+                Slug
+                <input id="post-slug" type="text" maxlength="180" placeholder="optional-auto-generated">
+              </label>
+              <label>
+                Cover image URL
+                <input id="post-cover" type="text" maxlength="800" placeholder="https://...">
+              </label>
+            </div>
+            <div class="stack compact">
+              <label>
+                Upload image to S3
+                <input id="post-image-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
+              </label>
+              <div class="actions">
+                <button class="secondary" type="button" id="upload-image-button">Upload image</button>
+                <span id="upload-state" class="helper"></span>
+              </div>
+            </div>
+            <label>
+              Summary
+              <textarea id="post-summary" maxlength="280" placeholder="Short teaser for cards and previews"></textarea>
+            </label>
+            <label>
+              Tags
+              <input id="post-tags" type="text" maxlength="300" placeholder="terraform, aws, devops">
+            </label>
+            <label>
+              Content
+              <textarea id="post-content" maxlength="12000" placeholder="Write the post body"></textarea>
+            </label>
+            <label class="check">
+              <input id="post-published" type="checkbox">
+              Publish immediately
+            </label>
+            <div class="actions">
+              <button class="primary" type="submit" id="save-post-button">Create post</button>
+              <button class="secondary" type="button" id="reset-post-button">Reset</button>
+            </div>
+          </form>
+        </section>
+      </section>
+
+      <section class="panel">
+        <h2>Latest Posts</h2>
+        <div id="posts" class="posts"></div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const tokenKey = 'marmil_blog_token';
+    const statusElement = document.getElementById('status');
+    const messageElement = document.getElementById('message');
+    const authStateElement = document.getElementById('auth-state');
+    const editorPanelElement = document.getElementById('editor-panel');
+    const postsElement = document.getElementById('posts');
+
+    const loginFormElement = document.getElementById('login-form');
+    const loginUsernameElement = document.getElementById('login-username');
+    const loginPasswordElement = document.getElementById('login-password');
+    const logoutButtonElement = document.getElementById('logout-button');
+
+    const postFormElement = document.getElementById('post-form');
+    const postIdElement = document.getElementById('post-id');
+    const postTitleElement = document.getElementById('post-title');
+    const postSlugElement = document.getElementById('post-slug');
+    const postCoverElement = document.getElementById('post-cover');
+    const postImageFileElement = document.getElementById('post-image-file');
+    const uploadImageButtonElement = document.getElementById('upload-image-button');
+    const uploadStateElement = document.getElementById('upload-state');
+    const postSummaryElement = document.getElementById('post-summary');
+    const postTagsElement = document.getElementById('post-tags');
+    const postContentElement = document.getElementById('post-content');
+    const postPublishedElement = document.getElementById('post-published');
+    const savePostButtonElement = document.getElementById('save-post-button');
+    const resetPostButtonElement = document.getElementById('reset-post-button');
+
+    const state = {
+      token: window.localStorage.getItem(tokenKey) || '',
+      adminUsername: '',
+      posts: []
+    };
+
+    function setMessage(kind, text) {
+      messageElement.innerHTML = '';
+      if (!text) {
+        return;
+      }
+      const element = document.createElement('div');
+      element.className = 'message ' + kind;
+      element.textContent = text;
+      messageElement.appendChild(element);
+    }
+
+    function setStatus(payload) {
+      const statuses = [
+        ['Database', payload.db_connectivity_ok],
+        ['Redis', payload.redis_connectivity_ok],
+        ['Auth config', payload.auth_loaded],
+        ['Ready', payload.ready]
+      ];
+      statusElement.innerHTML = '';
+      statuses.forEach(function(entry) {
+        const pill = document.createElement('div');
+        pill.className = 'pill';
+        const dot = document.createElement('span');
+        dot.className = 'dot ' + (entry[1] ? 'good' : 'bad');
+        const text = document.createElement('span');
+        text.textContent = entry[0] + ': ' + (entry[1] ? 'ok' : 'pending');
+        pill.appendChild(dot);
+        pill.appendChild(text);
+        statusElement.appendChild(pill);
+      });
+    }
+
+    function setAdminState(username) {
+      state.adminUsername = username || '';
+      const isAdmin = Boolean(state.adminUsername);
+      editorPanelElement.style.display = isAdmin ? 'block' : 'none';
+      authStateElement.textContent = isAdmin ? ('Signed in as ' + state.adminUsername) : 'Signed out';
+    }
+
+    function authHeaders() {
+      if (!state.token) {
+        return {};
+      }
+      return { Authorization: 'Bearer ' + state.token };
+    }
+
+    async function fetchJson(path, options) {
+      const init = options || {};
+      init.headers = Object.assign({}, authHeaders(), init.headers || {});
+      const response = await fetch(path, init);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || 'Request failed');
+      }
+      return payload;
+    }
+
+    function resetPostForm() {
+      postIdElement.value = '';
+      postTitleElement.value = '';
+      postSlugElement.value = '';
+      postCoverElement.value = '';
+      postImageFileElement.value = '';
+      uploadStateElement.textContent = '';
+      postSummaryElement.value = '';
+      postTagsElement.value = '';
+      postContentElement.value = '';
+      postPublishedElement.checked = false;
+      savePostButtonElement.textContent = 'Create post';
+    }
+
+    async function refreshHealth() {
+      const payload = await fetchJson('/ready');
+      setStatus(payload);
+    }
+
+    async function tryRestoreSession() {
+      if (!state.token) {
+        setAdminState('');
+        return;
+      }
+      try {
+        const payload = await fetchJson('/api/auth/me');
+        setAdminState(payload.username || 'admin');
+      } catch (error) {
+        window.localStorage.removeItem(tokenKey);
+        state.token = '';
+        setAdminState('');
+      }
+    }
+
+    function createActionButton(label, className, handler) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = className;
+      button.textContent = label;
+      button.addEventListener('click', handler);
+      return button;
+    }
+
+    async function submitComment(postId, form) {
+      const authorName = form.querySelector('[data-field="author-name"]').value;
+      const authorEmail = form.querySelector('[data-field="author-email"]').value;
+      const content = form.querySelector('[data-field="comment-content"]').value;
+      await fetchJson('/api/posts/' + postId + '/comments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          author_name: authorName,
+          author_email: authorEmail,
+          content: content
+        })
+      });
+      setMessage('info', 'Comment submitted.');
+      await refreshPosts();
+    }
+
+    function renderPosts(posts) {
+      postsElement.innerHTML = '';
+      if (!posts.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = state.adminUsername ? 'No posts yet. Use the editor to create the first draft.' : 'No published posts yet.';
+        postsElement.appendChild(empty);
+        return;
+      }
+
+      posts.forEach(function(post) {
+        const article = document.createElement('article');
+        article.className = 'post-card';
+
+        if (post.cover_image_url) {
+          const image = document.createElement('img');
+          image.className = 'post-cover';
+          image.src = post.cover_image_url;
+          image.alt = post.title;
+          article.appendChild(image);
+        }
+
+        const body = document.createElement('div');
+        body.className = 'post-body';
+        article.appendChild(body);
+
+        const topRow = document.createElement('div');
+        topRow.className = 'toolbar';
+        const badge = document.createElement('span');
+        badge.className = 'badge ' + (post.is_published ? 'published' : 'draft');
+        badge.textContent = post.is_published ? 'Published' : 'Draft';
+        topRow.appendChild(badge);
+        if (state.adminUsername) {
+          topRow.appendChild(createActionButton('Edit', 'secondary', function() {
+            postIdElement.value = String(post.id);
+            postTitleElement.value = post.title;
+            postSlugElement.value = post.slug;
+            postCoverElement.value = post.cover_image_url || '';
+            postSummaryElement.value = post.summary || '';
+            postTagsElement.value = (post.tags || []).join(', ');
+            postContentElement.value = post.content || '';
+            postPublishedElement.checked = post.is_published;
+            savePostButtonElement.textContent = 'Update post';
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          }));
+          topRow.appendChild(createActionButton('Delete', 'danger', async function() {
+            if (!window.confirm('Delete this post and its comments?')) {
+              return;
+            }
+            await fetchJson('/api/posts/' + post.id, { method: 'DELETE' });
+            setMessage('info', 'Post deleted.');
+            if (postIdElement.value === String(post.id)) {
+              resetPostForm();
+            }
+            await refreshPosts();
+          }));
+        }
+        body.appendChild(topRow);
+
+        const title = document.createElement('h2');
+        const titleLink = document.createElement('a');
+        titleLink.className = 'nav-link';
+        titleLink.href = '/posts/' + encodeURIComponent(post.slug);
+        titleLink.textContent = post.title;
+        title.appendChild(titleLink);
+        body.appendChild(title);
+
+        const meta = document.createElement('div');
+        meta.className = 'post-meta';
+        meta.textContent = 'Slug: ' + post.slug + ' • Updated ' + post.updated_at;
+        body.appendChild(meta);
+
+        if (post.summary) {
+          const summary = document.createElement('p');
+          summary.className = 'muted';
+          summary.textContent = post.summary;
+          body.appendChild(summary);
+        }
+
+        if (post.tags && post.tags.length) {
+          const tags = document.createElement('div');
+          tags.className = 'tags';
+          post.tags.forEach(function(tagName) {
+            const chip = document.createElement('span');
+            chip.className = 'tag';
+            chip.textContent = tagName;
+            tags.appendChild(chip);
+          });
+          body.appendChild(tags);
+        }
+
+        const content = document.createElement('div');
+        content.className = 'post-content';
+        content.textContent = post.content;
+        body.appendChild(content);
+
+        const commentsHeading = document.createElement('h3');
+        commentsHeading.textContent = 'Comments';
+        body.appendChild(commentsHeading);
+
+        const comments = document.createElement('div');
+        comments.className = 'comments';
+        if (post.comments && post.comments.length) {
+          post.comments.forEach(function(comment) {
+            const card = document.createElement('div');
+            card.className = 'comment-card';
+            const metaWrap = document.createElement('div');
+            metaWrap.className = 'comment-meta';
+            const author = document.createElement('strong');
+            author.textContent = comment.author_name;
+            metaWrap.appendChild(author);
+            const when = document.createElement('span');
+            when.className = 'muted';
+            when.textContent = comment.created_at;
+            metaWrap.appendChild(when);
+            if (state.adminUsername) {
+              metaWrap.appendChild(createActionButton('Delete', 'danger', async function() {
+                await fetchJson('/api/comments/' + comment.id, { method: 'DELETE' });
+                setMessage('info', 'Comment deleted.');
+                await refreshPosts();
+              }));
+            }
+            card.appendChild(metaWrap);
+            const bodyText = document.createElement('p');
+            bodyText.textContent = comment.content;
+            card.appendChild(bodyText);
+            comments.appendChild(card);
+          });
+        } else {
+          const emptyComment = document.createElement('div');
+          emptyComment.className = 'empty';
+          emptyComment.textContent = 'No comments yet.';
+          comments.appendChild(emptyComment);
+        }
+        body.appendChild(comments);
+
+        const commentForm = document.createElement('form');
+        commentForm.className = 'stacked-comment-form';
+        commentForm.innerHTML = '';
+        const authorNameLabel = document.createElement('label');
+        authorNameLabel.textContent = 'Your name';
+        const authorNameInput = document.createElement('input');
+        authorNameInput.type = 'text';
+        authorNameInput.required = true;
+        authorNameInput.maxLength = 120;
+        authorNameInput.setAttribute('data-field', 'author-name');
+        authorNameLabel.appendChild(authorNameInput);
+        commentForm.appendChild(authorNameLabel);
+
+        const authorEmailLabel = document.createElement('label');
+        authorEmailLabel.textContent = 'Your email';
+        const authorEmailInput = document.createElement('input');
+        authorEmailInput.type = 'text';
+        authorEmailInput.maxLength = 180;
+        authorEmailInput.setAttribute('data-field', 'author-email');
+        authorEmailLabel.appendChild(authorEmailInput);
+        commentForm.appendChild(authorEmailLabel);
+
+        const commentContentLabel = document.createElement('label');
+        commentContentLabel.textContent = 'Comment';
+        const commentContentInput = document.createElement('textarea');
+        commentContentInput.required = true;
+        commentContentInput.maxLength = 2000;
+        commentContentInput.setAttribute('data-field', 'comment-content');
+        commentContentLabel.appendChild(commentContentInput);
+        commentForm.appendChild(commentContentLabel);
+
+        const commentActions = document.createElement('div');
+        commentActions.className = 'actions';
+        const submitCommentButton = document.createElement('button');
+        submitCommentButton.type = 'submit';
+        submitCommentButton.className = 'primary';
+        submitCommentButton.textContent = 'Add comment';
+        commentActions.appendChild(submitCommentButton);
+        commentForm.appendChild(commentActions);
+        commentForm.addEventListener('submit', async function(event) {
+          event.preventDefault();
+          try {
+            await submitComment(post.id, commentForm);
+          } catch (error) {
+            setMessage('error', error.message);
+          }
+        });
+        body.appendChild(commentForm);
+
+        postsElement.appendChild(article);
+      });
+    }
+
+    async function refreshPosts() {
+      const payload = await fetchJson('/api/posts');
+      state.posts = payload.posts || [];
+      renderPosts(state.posts);
+    }
+
+    loginFormElement.addEventListener('submit', async function(event) {
+      event.preventDefault();
+      try {
+        const payload = await fetchJson('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: loginUsernameElement.value,
+            password: loginPasswordElement.value
+          })
+        });
+        state.token = payload.token;
+        window.localStorage.setItem(tokenKey, payload.token);
+        setAdminState(payload.username);
+        loginPasswordElement.value = '';
+        setMessage('info', 'Signed in successfully.');
+        await refreshPosts();
+      } catch (error) {
+        setMessage('error', error.message);
+      }
+    });
+
+    logoutButtonElement.addEventListener('click', async function() {
+      state.token = '';
+      window.localStorage.removeItem(tokenKey);
+      setAdminState('');
+      resetPostForm();
+      setMessage('info', 'Signed out.');
+      await refreshPosts();
+    });
+
+    postFormElement.addEventListener('submit', async function(event) {
+      event.preventDefault();
+      try {
+        const body = {
+          title: postTitleElement.value,
+          slug: postSlugElement.value,
+          summary: postSummaryElement.value,
+          cover_image_url: postCoverElement.value,
+          tags: postTagsElement.value,
+          content: postContentElement.value,
+          is_published: postPublishedElement.checked
+        };
+        const postId = postIdElement.value;
+        const path = postId ? '/api/posts/' + postId : '/api/posts';
+        const method = postId ? 'PUT' : 'POST';
+        await fetchJson(path, {
+          method: method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        resetPostForm();
+        setMessage('info', postId ? 'Post updated.' : 'Post created.');
+        await refreshPosts();
+      } catch (error) {
+        setMessage('error', error.message);
+      }
+    });
+
+    resetPostButtonElement.addEventListener('click', function() {
+      resetPostForm();
+      setMessage('', '');
+    });
+
+    uploadImageButtonElement.addEventListener('click', async function() {
+      const file = postImageFileElement.files[0];
+      if (!file) {
+        setMessage('error', 'Select an image file first.');
+        return;
+      }
+      uploadStateElement.textContent = 'Uploading...';
+      try {
+        const dataBase64 = await new Promise(function(resolve, reject) {
+          const reader = new FileReader();
+          reader.onerror = function() { reject(new Error('Failed to read the selected file.')); };
+          reader.onload = function() {
+            const result = String(reader.result || '');
+            const commaIndex = result.indexOf(',');
+            resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+          };
+          reader.readAsDataURL(file);
+        });
+        const payload = await fetchJson('/api/uploads', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            filename: file.name,
+            content_type: file.type,
+            data_base64: dataBase64
+          })
+        });
+        postCoverElement.value = payload.url;
+        uploadStateElement.textContent = 'Uploaded to ' + payload.key;
+        setMessage('info', 'Image uploaded and cover URL filled in.');
+      } catch (error) {
+        uploadStateElement.textContent = '';
+        setMessage('error', error.message);
+      }
+    });
+
+    async function boot() {
+      try {
+        await refreshHealth();
+        await tryRestoreSession();
+        await refreshPosts();
+      } catch (error) {
+        setMessage('error', error.message);
+      }
+    }
+
+    window.setInterval(function() {
+      refreshHealth().catch(function(error) {
+        setMessage('error', error.message);
+      });
+    }, 15000);
+
+    boot();
+  </script>
+</body>
+</html>
+"""
+
+
+def _recv_exact(connection, size):
+    buffer = bytearray()
+    while len(buffer) < size:
+        chunk = connection.recv(size - len(buffer))
+        if not chunk:
+            raise RuntimeError("Connection closed unexpectedly")
+        buffer.extend(chunk)
+    return bytes(buffer)
+
+
+def _recv_pg_message(connection):
+    message_type = _recv_exact(connection, 1)
+    message_length = int.from_bytes(_recv_exact(connection, 4), "big")
+    payload = _recv_exact(connection, message_length - 4)
+    return message_type.decode("ascii"), payload
+
+
+def _decode_pg_error(payload):
+    fields = payload.split(b"\x00")
+    details = []
+    for field in fields:
+        if len(field) > 1:
+            details.append(field[1:].decode("utf-8", errors="replace"))
+    return "; ".join(details) or "Unknown PostgreSQL error"
+
+
+def _send_pg_startup(connection, user, database):
+    parameters = (
+        b"user\x00" + user.encode("utf-8") + b"\x00"
+        + b"database\x00" + database.encode("utf-8") + b"\x00"
+        + b"client_encoding\x00UTF8\x00"
+        + b"\x00"
+    )
+    packet = (4 + 4 + len(parameters)).to_bytes(4, "big") + (196608).to_bytes(4, "big") + parameters
+    connection.sendall(packet)
+
+
+def _send_pg_password_message(connection, payload_bytes):
+    connection.sendall(b"p" + (4 + len(payload_bytes)).to_bytes(4, "big") + payload_bytes)
+
+
+def _send_pg_query(connection, query_text):
+    encoded = query_text.encode("utf-8") + b"\x00"
+    connection.sendall(b"Q" + (len(encoded) + 4).to_bytes(4, "big") + encoded)
+
+
+def _send_pg_ssl_request(connection):
+    connection.sendall((8).to_bytes(4, "big") + (80877103).to_bytes(4, "big"))
+
+
+def _wrap_postgres_tls(raw_connection):
+    _send_pg_ssl_request(raw_connection)
+    if _recv_exact(raw_connection, 1) != b"S":
+        raise RuntimeError("PostgreSQL server did not accept an SSL/TLS connection")
+
+    if DB_TLS_VERIFY:
+        context = ssl.create_default_context()
+    else:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+    wrapped = context.wrap_socket(raw_connection, server_hostname=DB_HOST)
+    wrapped.settimeout(5)
+    return wrapped
+
+
+def _parse_scram_attributes(message):
+    attributes = {}
+    for segment in message.split(","):
+        if "=" not in segment:
+            continue
+        key, value = segment.split("=", 1)
+        attributes[key] = value
+    return attributes
+
+
+def _scram_initial_message(username):
+    nonce = b64encode(os.urandom(18)).decode("ascii").rstrip("=")
+    safe_username = username.replace("=", "=3D").replace(",", "=2C")
+    client_first_bare = f"n={safe_username},r={nonce}"
+    client_first = f"n,,{client_first_bare}".encode("utf-8")
+    payload = b"SCRAM-SHA-256\x00" + len(client_first).to_bytes(4, "big") + client_first
+    return nonce, client_first_bare, payload
+
+
+def _scram_client_proof(password, nonce, client_first_bare, server_first_message):
+    attributes = _parse_scram_attributes(server_first_message)
+    server_nonce = attributes["r"]
+    if not server_nonce.startswith(nonce):
+        raise RuntimeError("PostgreSQL SCRAM server nonce did not extend the client nonce")
+
+    salt = b64decode(attributes["s"])
+    iterations = int(attributes["i"])
+    salted_password = pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    client_key = hmac_new(salted_password, b"Client Key", sha256).digest()
+    stored_key = sha256(client_key).digest()
+    client_final_without_proof = f"c=biws,r={server_nonce}"
+    auth_message = ",".join([client_first_bare, server_first_message, client_final_without_proof]).encode("utf-8")
+    client_signature = hmac_new(stored_key, auth_message, sha256).digest()
+    client_proof = bytes(left ^ right for left, right in zip(client_key, client_signature))
+    proof = b64encode(client_proof).decode("ascii")
+    return f"{client_final_without_proof},p={proof}".encode("utf-8")
+
+
+def _open_postgres_connection(password):
+    raw_connection = socket.create_connection((DB_HOST, DB_PORT), timeout=5)
+    try:
+        connection = _wrap_postgres_tls(raw_connection)
+    except Exception:
+        raw_connection.close()
+        raise
+
+    try:
+        _send_pg_startup(connection, DB_USERNAME, DB_NAME)
+        password_used = False
+        while True:
+            message_type, payload = _recv_pg_message(connection)
+            if message_type == "R":
+                auth_code = int.from_bytes(payload[:4], "big")
+                if auth_code == 0:
+                    continue
+                if auth_code == 3:
+                    _send_pg_password_message(connection, password.encode("utf-8") + b"\x00")
+                    password_used = True
+                    continue
+                if auth_code == 10:
+                    mechanisms = [item.decode("utf-8") for item in payload[4:].split(b"\x00") if item]
+                    if "SCRAM-SHA-256" not in mechanisms:
+                        raise RuntimeError(f"Unsupported PostgreSQL SASL mechanisms: {mechanisms}")
+                    nonce, client_first_bare, initial_payload = _scram_initial_message(DB_USERNAME)
+                    _send_pg_password_message(connection, initial_payload)
+                    server_type, server_payload = _recv_pg_message(connection)
+                    if server_type != "R" or int.from_bytes(server_payload[:4], "big") != 11:
+                        raise RuntimeError("Expected PostgreSQL SASL continue message")
+                    client_final = _scram_client_proof(password, nonce, client_first_bare, server_payload[4:].decode("utf-8"))
+                    _send_pg_password_message(connection, client_final)
+                    password_used = True
+                    continue
+                if auth_code == 11:
+                    raise RuntimeError("Unexpected PostgreSQL SASL continue message")
+                if auth_code == 12:
+                    continue
+                raise RuntimeError(f"Unsupported PostgreSQL authentication code: {auth_code}")
+            if message_type in ("S", "K"):
+                continue
+            if message_type == "Z":
+                if not password_used:
+                    raise RuntimeError("PostgreSQL connection reached ready state without password authentication")
+                return connection
+            if message_type == "E":
+                raise RuntimeError(_decode_pg_error(payload))
+    except Exception:
+        connection.close()
+        raise
+
+
+def _read_cstring(payload, index):
+    end_index = payload.index(b"\x00", index)
+    return payload[index:end_index].decode("utf-8"), end_index + 1
+
+
+def _parse_row_description(payload):
+    field_count = int.from_bytes(payload[:2], "big")
+    index = 2
+    columns = []
+    for _ in range(field_count):
+        name, index = _read_cstring(payload, index)
+        columns.append(name)
+        index += 18
+    return columns
+
+
+def _parse_data_row(payload):
+    value_count = int.from_bytes(payload[:2], "big")
+    index = 2
+    values = []
+    for _ in range(value_count):
+        value_length = int.from_bytes(payload[index:index + 4], "big", signed=True)
+        index += 4
+        if value_length == -1:
+            values.append(None)
+            continue
+        values.append(payload[index:index + value_length].decode("utf-8"))
+        index += value_length
+    return values
+
+
+def execute_postgres_query(password, query_text):
+    with _open_postgres_connection(password) as connection:
+        _send_pg_query(connection, query_text)
+        columns = []
+        rows = []
+        command_tag = ""
+        while True:
+            message_type, payload = _recv_pg_message(connection)
+            if message_type == "T":
+                columns = _parse_row_description(payload)
+                continue
+            if message_type == "D":
+                rows.append(_parse_data_row(payload))
+                continue
+            if message_type == "C":
+                command_tag = payload[:-1].decode("utf-8", errors="replace")
+                continue
+            if message_type in ("S", "K", "N", "I"):
+                continue
+            if message_type == "Z":
+                return {
+                    "columns": columns,
+                    "rows": [dict(zip(columns, row)) for row in rows],
+                    "command": command_tag,
+                }
+            if message_type == "E":
+                raise RuntimeError(_decode_pg_error(payload))
+
+
+def _send_resp_command(connection, *parts):
+    frame = [f"*{len(parts)}\r\n".encode("ascii")]
+    for part in parts:
+        encoded = str(part).encode("utf-8")
+        frame.append(f"$${len(encoded)}\r\n".encode("ascii"))
+        frame.append(encoded + b"\r\n")
+    connection.sendall(b"".join(frame))
+
+
+def _read_resp_line(connection):
+    buffer = bytearray()
+    while not buffer.endswith(b"\r\n"):
+        chunk = connection.recv(1)
+        if not chunk:
+            raise RuntimeError("Redis connection closed unexpectedly")
+        buffer.extend(chunk)
+    return bytes(buffer[:-2])
+
+
+def check_redis_connection(auth_token):
+    if not REDIS_HOST:
+        return False
+    with socket.create_connection((REDIS_HOST, REDIS_PORT), timeout=5) as raw_connection:
+        connection = raw_connection
+        if REDIS_TLS_ENABLED:
+            connection = ssl.create_default_context().wrap_socket(raw_connection, server_hostname=REDIS_HOST)
+        with connection:
+            if auth_token:
+                _send_resp_command(connection, "AUTH", auth_token)
+                response = _read_resp_line(connection)
+                if not response.startswith(b"+OK"):
+                    raise RuntimeError(f"Redis AUTH failed: {response.decode('utf-8', errors='replace')}")
+            _send_resp_command(connection, "PING")
+            response = _read_resp_line(connection)
+            if response != b"+PONG":
+                raise RuntimeError(f"Redis PING failed: {response.decode('utf-8', errors='replace')}")
+            return True
+
+
+def aws_cli_json(*args):
+    command = ["aws", "--region", AWS_REGION, *args]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "aws cli command failed"
+        raise RuntimeError(f"{' '.join(command)}: {message}")
+    return json.loads(result.stdout)
+
+
+def read_secret(secret_arn):
+    payload = aws_cli_json("secretsmanager", "get-secret-value", "--secret-id", secret_arn, "--output", "json")
+    secret_text = payload.get("SecretString", "")
+    if not secret_text:
+        raise RuntimeError(f"Secret {secret_arn} does not contain SecretString")
+    try:
+        secret_value = json.loads(secret_text)
+    except json.JSONDecodeError:
+        return {"value": secret_text}
+    if isinstance(secret_value, dict):
+        return secret_value
+    return {"value": secret_text}
+
+
+def _sql_literal(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _to_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return default
+
+
+def _slugify(text):
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return slug or f"post-{int(time.time())}"
+
+
+def _normalize_tags(raw_tags):
+    if isinstance(raw_tags, list):
+        values = raw_tags
+    else:
+        values = str(raw_tags or "").split(",")
+    tags = []
+    for value in values:
+        tag = str(value).strip().lower()
+        if tag and tag not in tags:
+            tags.append(tag[:40])
+    return tags
+
+
+def _serialize_tags(tags_text):
+    return [tag for tag in (tags_text or "").split(",") if tag]
+
+
+def _serialize_post(row, comments):
+    return {
+        "id": int(row["id"]),
+        "title": row["title"] or "",
+        "slug": row["slug"] or "",
+        "summary": row["summary"] or "",
+        "content": row["content"] or "",
+        "cover_image_url": row["cover_image_url"] or "",
+        "tags": _serialize_tags(row["tags"]),
+        "is_published": row["is_published"] == "t",
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "comments": comments,
+    }
+
+
+def _serialize_comment(row):
+    return {
+        "id": int(row["id"]),
+        "post_id": int(row["post_id"]),
+        "author_name": row["author_name"] or "",
+        "author_email": row["author_email"] or "",
+        "content": row["content"] or "",
+        "created_at": row["created_at"],
+    }
+
+
+def _html_page(title, body_html, hero_title=None, hero_text=None, eyebrow="Marmil Publishing"):
+    hero_markup = ""
+    if hero_title:
+        hero_markup = f"""
+        <section class=\"hero\">
+          <div class=\"eyebrow\">{html.escape(eyebrow)}</div>
+          <h1>{html.escape(hero_title)}</h1>
+          <p>{html.escape(hero_text or '')}</p>
+          <div class=\"actions\">
+            <a class=\"nav-link\" href=\"/\">Home</a>
+            <a class=\"nav-link\" href=\"/admin\">Admin</a>
+          </div>
+        </section>
+        """
+    return f"""<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>{html.escape(title)}</title>
+  <style>
+    :root {{
+      --ink: #172033;
+      --muted: #5f6b7a;
+      --paper: #fffdf7;
+      --panel: rgba(255, 255, 255, 0.92);
+      --accent: #b45309;
+      --line: #e9ddc7;
+      --shadow: 0 25px 60px rgba(86, 52, 11, 0.15);
+      --good: #166534;
+      --danger: #b91c1c;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      font-family: Georgia, \"Times New Roman\", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(245, 158, 11, 0.20), transparent 28%),
+        linear-gradient(160deg, #fff8eb 0%, #fffdf7 52%, #f6efe4 100%);
+    }}
+    .shell {{ width: min(1100px, calc(100vw - 28px)); margin: 24px auto 40px; display: grid; gap: 22px; }}
+    .hero, .panel, .post-card, .comment-card {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }}
+    .hero, .panel {{ padding: 28px; }}
+    .eyebrow {{ font-size: 13px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--accent); }}
+    h1 {{ margin: 0; font-size: clamp(2.4rem, 5vw, 4.6rem); line-height: 0.95; max-width: 12ch; }}
+    h2, h3, p {{ margin-top: 0; }}
+    .actions, .meta, .tags {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }}
+    .nav-link, .read-more {{ color: var(--accent); text-decoration: none; font-weight: 700; }}
+    .cards {{ display: grid; gap: 18px; }}
+    .post-card {{ overflow: hidden; }}
+    .post-body {{ padding: 24px; display: grid; gap: 14px; }}
+    .post-cover {{ width: 100%; aspect-ratio: 16 / 6; object-fit: cover; display: block; background: linear-gradient(135deg, #fbbf24, #fef3c7); }}
+    .muted {{ color: var(--muted); line-height: 1.6; }}
+    .tag {{ border-radius: 999px; padding: 7px 11px; border: 1px solid var(--line); background: #fffbeb; color: #9a5b0b; font-size: 0.9rem; }}
+    .badge {{ border-radius: 999px; padding: 8px 12px; border: 1px solid var(--line); background: white; font-size: 0.9rem; }}
+    .badge.published {{ background: #dcfce7; color: var(--good); }}
+    .content {{ white-space: pre-wrap; line-height: 1.75; color: #2d3748; }}
+    .comment-list {{ display: grid; gap: 12px; }}
+    .comment-card {{ padding: 16px; }}
+    form {{ display: grid; gap: 12px; }}
+    input, textarea {{ width: 100%; border: 1px solid #d8c6a6; border-radius: 16px; padding: 12px 14px; font: inherit; background: rgba(255, 252, 247, 0.92); }}
+    textarea {{ min-height: 120px; resize: vertical; }}
+    button {{ border: 0; border-radius: 999px; padding: 11px 18px; font: inherit; font-weight: 700; cursor: pointer; background: var(--accent); color: white; }}
+    .message {{ padding: 12px 14px; border-radius: 16px; }}
+    .message.info {{ background: #eff6ff; color: #1d4ed8; }}
+    .message.error {{ background: #fef2f2; color: var(--danger); }}
+    .empty {{ padding: 24px; text-align: center; border: 1px dashed #d8c6a6; border-radius: 20px; color: var(--muted); background: rgba(255, 255, 255, 0.75); }}
+    @media (max-width: 920px) {{
+      .shell {{ width: min(100vw - 16px, 1100px); margin: 16px auto 28px; }}
+      .hero, .panel, .post-card, .comment-card {{ border-radius: 20px; }}
+    }}
+  </style>
+</head>
+<body>
+  <main class=\"shell\">{hero_markup}{body_html}</main>
+</body>
+</html>
+"""
+
+
+def _render_tags(tags):
+    if not tags:
+        return ""
+    return "<div class=\"tags\">" + "".join(f"<span class=\"tag\">{html.escape(tag)}</span>" for tag in tags) + "</div>"
+
+
+def _render_comments(comments):
+    if not comments:
+        return '<div class="empty">No comments yet.</div>'
+    blocks = []
+    for comment in comments:
+        blocks.append(
+            "<article class=\"comment-card\">"
+            f"<div class=\"meta\"><strong>{html.escape(comment['author_name'])}</strong><span class=\"muted\">{html.escape(comment['created_at'])}</span></div>"
+            f"<p class=\"content\">{html.escape(comment['content'])}</p>"
+            "</article>"
+        )
+    return '<div class="comment-list">' + "".join(blocks) + "</div>"
+
+
+def _render_home_page(posts):
+    if not posts:
+        cards = '<div class="panel empty">No published posts yet.</div>'
+    else:
+        entries = []
+        for post in posts:
+            cover = ""
+            if post["cover_image_url"]:
+                cover = f'<img class="post-cover" src="{html.escape(post["cover_image_url"], quote=True)}" alt="{html.escape(post["title"], quote=True)}">'
+            summary = f'<p class="muted">{html.escape(post["summary"] or "")}</p>' if post["summary"] else ""
+            entries.append(
+                '<article class="post-card">'
+                + cover
+                + '<div class="post-body">'
+                + '<div class="meta"><span class="badge published">Published</span>'
+                + f'<span class="muted">Updated {html.escape(post["updated_at"])}</span></div>'
+                + f'<h2><a class="nav-link" href="/posts/{quote(post["slug"])}">{html.escape(post["title"])}</a></h2>'
+                + summary
+                + _render_tags(post["tags"])
+                + f'<div><a class="read-more" href="/posts/{quote(post["slug"])}">Read article</a></div>'
+                + '</div></article>'
+            )
+        cards = '<section class="cards">' + "".join(entries) + '</section>'
+    return _html_page(
+        f"{APP_NAME} Blog",
+        cards,
+        hero_title="Stories, updates, and technical notes.",
+        hero_text="Each post now has its own page. Browse published entries here, then open full articles and comments on dedicated URLs.",
+    )
+
+
+def _render_post_page(post, flash_message=None, flash_kind="info"):
+    cover = ""
+    if post["cover_image_url"]:
+        cover = f'<img class="post-cover" src="{html.escape(post["cover_image_url"], quote=True)}" alt="{html.escape(post["title"], quote=True)}">'
+    message_html = ""
+    if flash_message:
+        message_html = f'<div class="message {html.escape(flash_kind)}">{html.escape(flash_message)}</div>'
+    body = (
+        '<article class="post-card">'
+        + cover
+        + '<div class="post-body">'
+        + f'<div class="meta"><span class="badge published">Published</span><span class="muted">Updated {html.escape(post["updated_at"])}</span></div>'
+        + f'<h2>{html.escape(post["title"])}</h2>'
+        + (f'<p class="muted">{html.escape(post["summary"])} </p>'.replace(" </p>", "</p>") if post["summary"] else "")
+        + _render_tags(post["tags"])
+        + f'<div class="content">{html.escape(post["content"])}</div>'
+        + '</div></article>'
+        + '<section class="panel">'
+        + message_html
+        + '<h3>Comments</h3>'
+        + _render_comments(post["comments"])
+        + '<form method="post" action="/posts/' + quote(post["slug"]) + '/comments">'
+        + '<label>Your name<input name="author_name" type="text" maxlength="120" required></label>'
+        + '<label>Your email<input name="author_email" type="text" maxlength="180"></label>'
+        + '<label>Comment<textarea name="content" maxlength="2000" required></textarea></label>'
+        + '<button type="submit">Add comment</button>'
+        + '</form></section>'
+    )
+    return _html_page(post["title"], body, hero_title=post["title"], hero_text=post["summary"] or "Read the full article and join the discussion.")
+
+
+def _render_not_found_page(title, message):
+    return _html_page(title, f'<section class="panel empty">{html.escape(message)}</section>', hero_title=title, hero_text=message)
+
+
+def _get_runtime_auth():
+    with STATE_LOCK:
+        return STATE["admin_username"], STATE["admin_password"], STATE["token_secret"]
+
+
+def _get_db_password():
+    with STATE_LOCK:
+        return STATE["db_password"]
+
+
+def _urlsafe_encode(raw_bytes):
+    return urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
+
+
+def _urlsafe_decode(text):
+    return urlsafe_b64decode(text + ("=" * (-len(text) % 4)))
+
+
+def _make_token(username, token_secret):
+    payload = _urlsafe_encode(json.dumps({"sub": username, "exp": int(time.time()) + TOKEN_TTL_SECONDS}, separators=(",", ":")).encode("utf-8"))
+    signature = _urlsafe_encode(hmac_new(token_secret.encode("utf-8"), payload.encode("utf-8"), sha256).digest())
+    return payload + "." + signature
+
+
+def _verify_token(token, token_secret):
+    if not token or "." not in token:
+        return None
+    payload_segment, signature_segment = token.split(".", 1)
+    expected_signature = _urlsafe_encode(hmac_new(token_secret.encode("utf-8"), payload_segment.encode("utf-8"), sha256).digest())
+    if expected_signature != signature_segment:
+        return None
+    payload = json.loads(_urlsafe_decode(payload_segment).decode("utf-8"))
+    if int(payload.get("exp", 0)) < int(time.time()):
+        return None
+    return payload.get("sub")
+
+
+def _admin_username_from_headers(headers):
+    _, _, token_secret = _get_runtime_auth()
+    if not token_secret:
+        return None
+    authorization = headers.get("Authorization", "")
+    if not authorization.startswith("Bearer "):
+        return None
+    return _verify_token(authorization[7:].strip(), token_secret)
+
+
+def _normalize_upload_filename(filename, content_type):
+    extension = ALLOWED_IMAGE_CONTENT_TYPES.get(content_type)
+    if not extension:
+        raise ValueError("unsupported image content_type")
+    stem = re.sub(r"[^a-zA-Z0-9._-]+", "-", os.path.splitext(filename or "image")[0]).strip("-._") or "image"
+    return stem[:48] + extension
+
+
+def upload_media_image(payload):
+    if not MEDIA_BUCKET_NAME or not MEDIA_BASE_URL:
+        raise RuntimeError("media bucket configuration is not available")
+    content_type = (payload.get("content_type") or "").strip().lower()
+    filename = _normalize_upload_filename(payload.get("filename") or "image", content_type)
+    data_base64 = payload.get("data_base64") or ""
+    try:
+        raw = b64decode(data_base64, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("invalid base64 image payload")
+    if not raw:
+        raise ValueError("image payload is empty")
+    if len(raw) > MEDIA_UPLOAD_MAX_BYTES:
+        raise ValueError(f"image exceeds {MEDIA_UPLOAD_MAX_BYTES} bytes")
+
+    key = f"posts/{int(time.time())}-{uuid.uuid4().hex[:10]}-{filename}"
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(raw)
+            temp_path = handle.name
+        aws_cli_json(
+            "s3api",
+            "put-object",
+            "--bucket",
+            MEDIA_BUCKET_NAME,
+            "--key",
+            key,
+            "--body",
+            temp_path,
+            "--content-type",
+            content_type,
+            "--cache-control",
+            "public,max-age=31536000,immutable",
+        )
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    return {"key": key, "url": f"{MEDIA_BASE_URL}/{key}"}
+
+
+def ensure_blog_schema(password):
+    execute_postgres_query(
+        password,
+        """
+        CREATE TABLE IF NOT EXISTS blog_posts (
+            id BIGSERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            slug TEXT NOT NULL UNIQUE,
+            summary TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            cover_image_url TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '',
+            is_published BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS blog_comments (
+            id BIGSERIAL PRIMARY KEY,
+            post_id BIGINT NOT NULL REFERENCES blog_posts(id) ON DELETE CASCADE,
+            author_name TEXT NOT NULL,
+            author_email TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """,
+    )
+
+
+def _slug_exists(password, slug, exclude_post_id=None):
+    query = "SELECT id FROM blog_posts WHERE slug = " + _sql_literal(slug)
+    if exclude_post_id is not None:
+        query += " AND id <> " + str(exclude_post_id)
+    query += ";"
+    return bool(execute_postgres_query(password, query)["rows"])
+
+
+def _normalize_post_payload(payload, password, post_id=None):
+    title = (payload.get("title") or "").strip()
+    if not title:
+        raise ValueError("title is required")
+    if len(title) > 160:
+        raise ValueError("title must be 160 characters or fewer")
+
+    slug = _slugify((payload.get("slug") or "").strip() or title)
+    if _slug_exists(password, slug, exclude_post_id=post_id):
+        raise ValueError("slug already exists")
+
+    summary = (payload.get("summary") or "").strip()
+    content = (payload.get("content") or "").strip()
+    if not content:
+        raise ValueError("content is required")
+    if len(summary) > MAX_SUMMARY_LENGTH:
+        raise ValueError("summary must be 280 characters or fewer")
+    if len(content) > MAX_CONTENT_LENGTH:
+        raise ValueError("content must be 12000 characters or fewer")
+
+    cover_image_url = (payload.get("cover_image_url") or "").strip()
+    tags = _normalize_tags(payload.get("tags") or "")
+    return {
+        "title": title,
+        "slug": slug,
+        "summary": summary,
+        "content": content,
+        "cover_image_url": cover_image_url,
+        "tags": ",".join(tags),
+        "is_published": _to_bool(payload.get("is_published"), False),
+    }
+
+
+def _normalize_comment_payload(payload):
+    author_name = (payload.get("author_name") or "").strip()
+    content = (payload.get("content") or "").strip()
+    author_email = (payload.get("author_email") or "").strip()
+    if not author_name:
+        raise ValueError("author_name is required")
+    if not content:
+        raise ValueError("content is required")
+    if len(author_name) > 120:
+        raise ValueError("author_name must be 120 characters or fewer")
+    if len(author_email) > 180:
+        raise ValueError("author_email must be 180 characters or fewer")
+    if len(content) > MAX_COMMENT_LENGTH:
+        raise ValueError("content must be 2000 characters or fewer")
+    return {
+        "author_name": author_name,
+        "author_email": author_email,
+        "content": content,
+    }
+
+
+def list_comments(password, post_id):
+    result = execute_postgres_query(
+        password,
+        "SELECT id, post_id, author_name, author_email, content, created_at::text FROM blog_comments WHERE post_id = " + str(post_id) + " ORDER BY id DESC;",
+    )
+    return [_serialize_comment(row) for row in result["rows"]]
+
+
+def list_posts(password, include_drafts):
+    query = "SELECT id, title, slug, summary, content, cover_image_url, tags, is_published, created_at::text, updated_at::text FROM blog_posts"
+    if not include_drafts:
+        query += " WHERE is_published = TRUE"
+    query += " ORDER BY created_at DESC;"
+    result = execute_postgres_query(password, query)
+    posts = []
+    for row in result["rows"]:
+        posts.append(_serialize_post(row, list_comments(password, int(row["id"]))))
+    return posts
+
+
+def get_post_by_slug(password, slug, include_drafts):
+    query = (
+        "SELECT id, title, slug, summary, content, cover_image_url, tags, is_published, created_at::text, updated_at::text "
+        "FROM blog_posts WHERE slug = " + _sql_literal(slug)
+    )
+    if not include_drafts:
+        query += " AND is_published = TRUE"
+    query += " LIMIT 1;"
+    result = execute_postgres_query(password, query)
+    if not result["rows"]:
+        return None
+    row = result["rows"][0]
+    return _serialize_post(row, list_comments(password, int(row["id"])))
+
+
+def get_post(password, post_id, include_drafts):
+    query = (
+        "SELECT id, title, slug, summary, content, cover_image_url, tags, is_published, created_at::text, updated_at::text "
+        "FROM blog_posts WHERE id = " + str(post_id)
+    )
+    if not include_drafts:
+        query += " AND is_published = TRUE"
+    query += ";"
+    result = execute_postgres_query(password, query)
+    if not result["rows"]:
+        return None
+    row = result["rows"][0]
+    return _serialize_post(row, list_comments(password, int(row["id"])))
+
+
+def create_post(password, payload):
+    post = _normalize_post_payload(payload, password)
+    query = (
+        "INSERT INTO blog_posts (title, slug, summary, content, cover_image_url, tags, is_published) VALUES ("
+        + _sql_literal(post["title"])
+        + ", "
+        + _sql_literal(post["slug"])
+        + ", "
+        + _sql_literal(post["summary"])
+        + ", "
+        + _sql_literal(post["content"])
+        + ", "
+        + _sql_literal(post["cover_image_url"])
+        + ", "
+        + _sql_literal(post["tags"])
+        + ", "
+        + _sql_literal(post["is_published"])
+        + ") RETURNING id;"
+    )
+    result = execute_postgres_query(password, query)
+    return get_post(password, int(result["rows"][0]["id"]), True)
+
+
+def update_post(password, post_id, payload):
+    post = _normalize_post_payload(payload, password, post_id=post_id)
+    query = (
+        "UPDATE blog_posts SET title = "
+        + _sql_literal(post["title"])
+        + ", slug = "
+        + _sql_literal(post["slug"])
+        + ", summary = "
+        + _sql_literal(post["summary"])
+        + ", content = "
+        + _sql_literal(post["content"])
+        + ", cover_image_url = "
+        + _sql_literal(post["cover_image_url"])
+        + ", tags = "
+        + _sql_literal(post["tags"])
+        + ", is_published = "
+        + _sql_literal(post["is_published"])
+        + ", updated_at = NOW() WHERE id = "
+        + str(post_id)
+        + " RETURNING id;"
+    )
+    result = execute_postgres_query(password, query)
+    if not result["rows"]:
+        return None
+    return get_post(password, post_id, True)
+
+
+def delete_post(password, post_id):
+    result = execute_postgres_query(password, "DELETE FROM blog_posts WHERE id = " + str(post_id) + " RETURNING id;")
+    return bool(result["rows"])
+
+
+def create_comment(password, post_id, payload):
+    if not get_post(password, post_id, True):
+        return None
+    comment = _normalize_comment_payload(payload)
+    query = (
+        "INSERT INTO blog_comments (post_id, author_name, author_email, content) VALUES ("
+        + str(post_id)
+        + ", "
+        + _sql_literal(comment["author_name"])
+        + ", "
+        + _sql_literal(comment["author_email"])
+        + ", "
+        + _sql_literal(comment["content"])
+        + ") RETURNING id, post_id, author_name, author_email, content, created_at::text;"
+    )
+    result = execute_postgres_query(password, query)
+    return _serialize_comment(result["rows"][0])
+
+
+def delete_comment(password, comment_id):
+    result = execute_postgres_query(password, "DELETE FROM blog_comments WHERE id = " + str(comment_id) + " RETURNING id;")
+    return bool(result["rows"])
+
+
+def refresh_runtime_secrets():
+    db_secret = read_secret(DB_SECRET_ARN)
+    auth_secret = read_secret(AUTH_SECRET_ARN)
+
+    db_password = db_secret.get("password") or db_secret.get("value")
+    if not db_password:
+        raise RuntimeError("Database secret did not include a password field")
+
+    admin_username = auth_secret.get("username")
+    admin_password = auth_secret.get("password")
+    token_secret = auth_secret.get("token_secret")
+    if not admin_username or not admin_password or not token_secret:
+        raise RuntimeError("Authentication secret must contain username, password, and token_secret")
+
+    ensure_blog_schema(db_password)
+
+    redis_auth_loaded = False
+    redis_connectivity_ok = False
+    if REDIS_AUTH_TOKEN_SECRET_ARN:
+        redis_secret = read_secret(REDIS_AUTH_TOKEN_SECRET_ARN)
+        redis_token = redis_secret.get("auth_token") or redis_secret.get("value")
+        if not redis_token:
+            raise RuntimeError("Redis auth secret did not include an auth token")
+        redis_auth_loaded = True
+        redis_connectivity_ok = check_redis_connection(redis_token)
+    elif REDIS_HOST:
+        redis_connectivity_ok = check_redis_connection("")
+
+    with STATE_LOCK:
+        STATE["db_password"] = db_password
+        STATE["admin_username"] = admin_username
+        STATE["admin_password"] = admin_password
+        STATE["token_secret"] = token_secret
+        STATE["db_password_loaded"] = True
+        STATE["auth_loaded"] = True
+        STATE["redis_auth_loaded"] = redis_auth_loaded
+        STATE["db_connectivity_ok"] = True
+        STATE["redis_connectivity_ok"] = redis_connectivity_ok
+        STATE["last_refresh_epoch"] = int(time.time())
+        STATE["last_refresh_error"] = None
+
+
+def refresh_loop():
+    while True:
+        try:
+            refresh_runtime_secrets()
+        except Exception as exc:
+            LOGGER.exception("Runtime secret refresh failed: %s", exc)
+            with STATE_LOCK:
+                STATE["db_password"] = None
+                STATE["admin_username"] = None
+                STATE["admin_password"] = None
+                STATE["token_secret"] = None
+                STATE["db_password_loaded"] = False
+                STATE["auth_loaded"] = False
+                STATE["redis_auth_loaded"] = False
+                STATE["db_connectivity_ok"] = False
+                STATE["redis_connectivity_ok"] = False
+                STATE["last_refresh_error"] = str(exc)
+        time.sleep(REFRESH_INTERVAL_SECONDS)
+
+
+def build_status_payload():
+    with STATE_LOCK:
+        return {
+            "app_name": APP_NAME,
+            "instance_id": os.environ.get("INSTANCE_ID"),
+            "db_host": DB_HOST,
+            "db_name": DB_NAME,
+            "db_password_loaded": STATE["db_password_loaded"],
+            "auth_loaded": STATE["auth_loaded"],
+            "db_connectivity_ok": STATE["db_connectivity_ok"],
+            "redis_host": REDIS_HOST,
+            "redis_tls_enabled": REDIS_TLS_ENABLED,
+            "redis_auth_loaded": STATE["redis_auth_loaded"],
+            "redis_connectivity_ok": STATE["redis_connectivity_ok"],
+            "last_refresh_epoch": STATE["last_refresh_epoch"],
+            "last_refresh_error": STATE["last_refresh_error"],
+        }
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send_json(self, payload, status_code=200):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html_text):
+        body = html_text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _redirect(self, location, status_code=303):
+        self.send_response(status_code)
+        self.send_header("Location", location)
+        self.end_headers()
+
+    def _parse_json_body(self):
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length else b"{}"
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON body: {exc.msg}")
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
+
+    def _parse_form_body(self):
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length else b""
+        fields = parse_qs(raw_body.decode("utf-8"), keep_blank_values=True)
+        return {key: values[0] if values else "" for key, values in fields.items()}
+
+    def _require_db_password(self):
+        password = _get_db_password()
+        if not password:
+            raise RuntimeError("application is still waiting for database credentials")
+        return password
+
+    def _require_admin(self):
+        username = _admin_username_from_headers(self.headers)
+        if not username:
+            raise PermissionError("admin authentication required")
+        return username
+
+    def _handle_error(self, error):
+        if isinstance(error, PermissionError):
+            self._send_json({"error": str(error)}, 401)
+            return
+        if isinstance(error, ValueError):
+            self._send_json({"error": str(error)}, 400)
+            return
+        self._send_json({"error": str(error)}, 503)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path == "/":
+                self._send_html(_render_home_page(list_posts(self._require_db_password(), False)))
+                return
+
+            if path == "/admin":
+                self._send_html(APPLICATION_HTML)
+                return
+
+            if path in ("/health", "/ready"):
+                payload = build_status_payload()
+                ready = payload["db_password_loaded"] and payload["db_connectivity_ok"] and payload["auth_loaded"]
+                if REDIS_HOST:
+                    ready = ready and payload["redis_connectivity_ok"]
+                payload["ready"] = ready
+                self._send_json(payload, 200 if path == "/health" or ready else 503)
+                return
+
+            if path == "/api/auth/me":
+                username = self._require_admin()
+                self._send_json({"username": username})
+                return
+
+            if path == "/api/posts":
+                include_drafts = bool(_admin_username_from_headers(self.headers))
+                self._send_json({"posts": list_posts(self._require_db_password(), include_drafts)})
+                return
+
+            parts = [part for part in path.split("/") if part]
+            if len(parts) == 2 and parts[0] == "posts":
+                include_drafts = bool(_admin_username_from_headers(self.headers))
+                post = get_post_by_slug(self._require_db_password(), parts[1], include_drafts)
+                if not post:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    not_found = _render_not_found_page("Post not found", "The requested post does not exist or is not published.")
+                    self.send_header("Content-Length", str(len(not_found.encode("utf-8"))))
+                    self.end_headers()
+                    self.wfile.write(not_found.encode("utf-8"))
+                    return
+                query = parse_qs(parsed.query)
+                if query.get("comment") == ["posted"]:
+                    flash_message = "Comment submitted."
+                    flash_kind = "info"
+                elif query.get("error") == ["comment"]:
+                    flash_message = "Comment submission failed. Check the fields and try again."
+                    flash_kind = "error"
+                else:
+                    flash_message = None
+                    flash_kind = "info"
+                self._send_html(_render_post_page(post, flash_message, flash_kind))
+                return
+
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "posts" and parts[2].isdigit():
+                include_drafts = bool(_admin_username_from_headers(self.headers))
+                post = get_post(self._require_db_password(), int(parts[2]), include_drafts)
+                if not post:
+                    self._send_json({"error": "not_found"}, 404)
+                    return
+                self._send_json({"post": post})
+                return
+
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "posts" and parts[2].isdigit() and parts[3] == "comments":
+                post = get_post(self._require_db_password(), int(parts[2]), True)
+                if not post:
+                    self._send_json({"error": "not_found"}, 404)
+                    return
+                if (not post["is_published"]) and not _admin_username_from_headers(self.headers):
+                    self._send_json({"error": "not_found"}, 404)
+                    return
+                self._send_json({"comments": post["comments"]})
+                return
+
+            self._send_json({"error": "not_found", "path": path}, 404)
+        except Exception as error:
+            self._handle_error(error)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path == "/api/auth/login":
+                payload = self._parse_json_body()
+                admin_username, admin_password, token_secret = _get_runtime_auth()
+                if not admin_username or not admin_password or not token_secret:
+                    raise RuntimeError("authentication configuration has not loaded yet")
+                if payload.get("username") != admin_username or payload.get("password") != admin_password:
+                    raise PermissionError("invalid admin credentials")
+                self._send_json({
+                    "username": admin_username,
+                    "token": _make_token(admin_username, token_secret),
+                    "expires_in_seconds": TOKEN_TTL_SECONDS,
+                })
+                return
+
+            if path == "/api/posts":
+                self._require_admin()
+                post = create_post(self._require_db_password(), self._parse_json_body())
+                self._send_json({"post": post}, 201)
+                return
+
+            if path == "/api/uploads":
+                self._require_admin()
+                upload = upload_media_image(self._parse_json_body())
+                self._send_json(upload, 201)
+                return
+
+            parts = [part for part in path.split("/") if part]
+            if len(parts) == 3 and parts[0] == "posts" and parts[2] == "comments":
+                post = get_post_by_slug(self._require_db_password(), parts[1], False)
+                if not post:
+                    self._redirect("/", 303)
+                    return
+                try:
+                    create_comment(self._require_db_password(), post["id"], self._parse_form_body())
+                except Exception:
+                    self._redirect(f"/posts/{quote(parts[1])}?error=comment", 303)
+                    return
+                self._redirect(f"/posts/{quote(parts[1])}?comment=posted", 303)
+                return
+
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "posts" and parts[2].isdigit() and parts[3] == "comments":
+                comment = create_comment(self._require_db_password(), int(parts[2]), self._parse_json_body())
+                if not comment:
+                    self._send_json({"error": "not_found"}, 404)
+                    return
+                self._send_json({"comment": comment}, 201)
+                return
+
+            self._send_json({"error": "not_found", "path": path}, 404)
+        except Exception as error:
+            self._handle_error(error)
+
+    def do_PUT(self):
+        parsed = urlparse(self.path)
+        parts = [part for part in parsed.path.split("/") if part]
+        try:
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "posts" and parts[2].isdigit():
+                self._require_admin()
+                post = update_post(self._require_db_password(), int(parts[2]), self._parse_json_body())
+                if not post:
+                    self._send_json({"error": "not_found"}, 404)
+                    return
+                self._send_json({"post": post})
+                return
+            self._send_json({"error": "not_found", "path": parsed.path}, 404)
+        except Exception as error:
+            self._handle_error(error)
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        parts = [part for part in parsed.path.split("/") if part]
+        try:
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "posts" and parts[2].isdigit():
+                self._require_admin()
+                if not delete_post(self._require_db_password(), int(parts[2])):
+                    self._send_json({"error": "not_found"}, 404)
+                    return
+                self._send_json({"deleted": True, "id": int(parts[2])})
+                return
+
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "comments" and parts[2].isdigit():
+                self._require_admin()
+                if not delete_comment(self._require_db_password(), int(parts[2])):
+                    self._send_json({"error": "not_found"}, 404)
+                    return
+                self._send_json({"deleted": True, "id": int(parts[2])})
+                return
+
+            self._send_json({"error": "not_found", "path": parsed.path}, 404)
+        except Exception as error:
+            self._handle_error(error)
+
+    def log_message(self, fmt, *args):
+        LOGGER.info("%s %s", self.address_string(), fmt % args)
+
+
+if __name__ == "__main__":
+    LOGGER.info("Starting blog server on port %s", APP_PORT)
+    refresh_thread = threading.Thread(target=refresh_loop, name="secret-refresh", daemon=True)
+    refresh_thread.start()
+    ThreadingHTTPServer(("0.0.0.0", APP_PORT), Handler).serve_forever()

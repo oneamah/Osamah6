@@ -1,0 +1,24 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local variable files and CLI config can contain secrets.
+*.tfvars
+*.tfvars.json
+.terraformrc
+terraform.rc
+
+# OS and editor noise.
+.DS_Store
+Thumbs.db
+.vscode/*.code-workspace
+
+# Python cache files if local tooling is used in the repo.
+__pycache__/
+*.pyc

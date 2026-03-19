@@ -1,0 +1,63 @@
+#!/bin/bash
+set -euxo pipefail
+
+APP_DIR="${app_dir}"
+APP_LOG_FILE="${app_log_file}"
+APP_LOG_DIR=$(dirname "$${APP_LOG_FILE}")
+
+IMDS_TOKEN=$(curl -fsSL -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+INSTANCE_ID=$(curl -fsSL -H "X-aws-ec2-metadata-token: $${IMDS_TOKEN}" http://169.254.169.254/latest/meta-data/instance-id)
+
+mkdir -p "${app_dir}" "$${APP_LOG_DIR}"
+touch "$${APP_LOG_FILE}"
+
+if ! command -v aws >/dev/null 2>&1; then
+  echo "aws cli is required for backend startup" >&2
+  exit 1
+fi
+
+cat > /etc/${project_name}.env <<ENV
+${app_env}
+INSTANCE_ID=$${INSTANCE_ID}
+ENV
+
+aws --region "$(awk -F= '/^AWS_REGION=/{print $2}' /etc/${project_name}.env)" \
+  secretsmanager get-secret-value \
+  --secret-id "${backend_app_secret_arn}" \
+  --query SecretString \
+  --output text | base64 -d | gunzip > "${app_dir}/app.py"
+chmod 0755 "${app_dir}/app.py"
+
+if ! rpm -q amazon-cloudwatch-agent >/dev/null 2>&1; then
+  curl -fsSL -o /tmp/amazon-cloudwatch-agent.rpm "https://amazoncloudwatch-agent.s3.amazonaws.com/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm"
+  dnf install -y /tmp/amazon-cloudwatch-agent.rpm
+fi
+
+mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWAGENT'
+${cwagent_config}
+CWAGENT
+
+cat > /etc/systemd/system/${project_name}-app.service <<UNIT
+[Unit]
+Description=${project_name} backend service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${app_dir}
+EnvironmentFile=/etc/${project_name}.env
+ExecStart=/usr/bin/python3 ${app_dir}/app.py
+Restart=always
+RestartSec=5
+StandardOutput=append:${app_log_file}
+StandardError=append:${app_log_file}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now ${project_name}-app.service
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s

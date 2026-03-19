@@ -1,0 +1,1154 @@
+import json
+import logging
+import os
+import socket
+import ssl
+import subprocess
+import threading
+import time
+from base64 import b64decode, b64encode
+from hashlib import pbkdf2_hmac, sha256
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from hmac import new as hmac_new
+from urllib.parse import urlparse
+
+
+APP_NAME = os.environ.get("APP_NAME", "app")
+APP_PORT = int(os.environ.get("APP_PORT", "80"))
+AWS_REGION = os.environ["AWS_REGION"]
+DB_HOST = os.environ["DB_HOST"]
+DB_PORT = int(os.environ.get("DB_PORT", "5432"))
+DB_NAME = os.environ["DB_NAME"]
+DB_USERNAME = os.environ["DB_USERNAME"]
+DB_SECRET_ARN = os.environ["DB_SECRET_ARN"]
+DB_TLS_VERIFY = os.environ.get("DB_TLS_VERIFY", "false").lower() == "true"
+REDIS_HOST = os.environ.get("REDIS_HOST", "")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_TLS_ENABLED = os.environ.get("REDIS_TLS_ENABLED", "false").lower() == "true"
+REDIS_AUTH_TOKEN_SECRET_ARN = os.environ.get("REDIS_AUTH_TOKEN_SECRET_ARN", "")
+REFRESH_INTERVAL_SECONDS = max(60, int(os.environ.get("APP_SECRET_REFRESH_INTERVAL_SECONDS", "300")))
+MAX_TEXT_LENGTH = 2000
+
+logging.basicConfig(
+    level=os.environ.get("APP_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+LOGGER = logging.getLogger(APP_NAME)
+
+STATE_LOCK = threading.Lock()
+STATE = {
+    "db_password": None,
+    "db_password_loaded": False,
+    "redis_auth_loaded": False,
+    "db_connectivity_ok": False,
+    "redis_connectivity_ok": False,
+    "last_refresh_epoch": None,
+    "last_refresh_error": None,
+}
+
+APPLICATION_HTML = """<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>Marmil CRUD</title>
+  <style>
+    :root {
+      --ink: #1f2933;
+      --muted: #6b7280;
+      --paper: #fffaf2;
+      --panel: #ffffff;
+      --accent: #d97706;
+      --accent-dark: #92400e;
+      --line: #ead8bf;
+      --success: #166534;
+      --danger: #b91c1c;
+      --shadow: 0 20px 45px rgba(84, 48, 12, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: \"Trebuchet MS\", \"Gill Sans\", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(217, 119, 6, 0.18), transparent 32%),
+        linear-gradient(160deg, #fff7ed 0%, #fffaf2 55%, #f8efe2 100%);
+    }
+    .shell {
+      width: min(1120px, calc(100vw - 32px));
+      margin: 32px auto;
+      display: grid;
+      gap: 24px;
+    }
+    .hero, .panel {
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+    .hero {
+      padding: 28px;
+      display: grid;
+      gap: 14px;
+    }
+    .eyebrow {
+      color: var(--accent-dark);
+      font-size: 13px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 5vw, 3.5rem);
+      line-height: 0.95;
+      max-width: 10ch;
+    }
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 62ch;
+      font-size: 1.05rem;
+    }
+    .layout {
+      display: grid;
+      gap: 24px;
+      grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+    }
+    .panel {
+      padding: 24px;
+    }
+    .section-title {
+      margin: 0 0 14px;
+      font-size: 1.2rem;
+    }
+    .status-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      padding: 10px 14px;
+      background: #fff;
+      border: 1px solid var(--line);
+      font-size: 0.92rem;
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: #d1d5db;
+    }
+    .dot.good { background: #16a34a; }
+    .dot.bad { background: #dc2626; }
+    form {
+      display: grid;
+      gap: 12px;
+    }
+    label {
+      display: grid;
+      gap: 6px;
+      font-size: 0.95rem;
+      font-weight: 600;
+    }
+    input[type=\"text\"], textarea {
+      width: 100%;
+      border: 1px solid #d9c3a4;
+      border-radius: 16px;
+      padding: 12px 14px;
+      font: inherit;
+      color: var(--ink);
+      background: rgba(255, 250, 242, 0.85);
+    }
+    textarea {
+      min-height: 120px;
+      resize: vertical;
+    }
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 600;
+    }
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 18px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 120ms ease, opacity 120ms ease;
+    }
+    button:hover { transform: translateY(-1px); }
+    button.primary {
+      background: var(--accent);
+      color: white;
+    }
+    button.secondary {
+      background: #f6ead7;
+      color: var(--accent-dark);
+    }
+    button.danger {
+      background: #fee2e2;
+      color: var(--danger);
+    }
+    .items {
+      display: grid;
+      gap: 14px;
+    }
+    .item {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(255,247,237,0.92));
+    }
+    .item-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 10px;
+    }
+    .item-title {
+      margin: 0;
+      font-size: 1.05rem;
+    }
+    .item-meta {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 7px 10px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      background: #fef3c7;
+      color: #92400e;
+    }
+    .badge.done {
+      background: #dcfce7;
+      color: var(--success);
+    }
+    .item p {
+      margin: 0 0 14px;
+      color: #495463;
+      white-space: pre-wrap;
+    }
+    .empty {
+      border: 1px dashed #d9c3a4;
+      border-radius: 18px;
+      padding: 32px;
+      text-align: center;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.7);
+    }
+    .banner {
+      margin-top: 10px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      font-size: 0.92rem;
+    }
+    .banner.info {
+      background: #eff6ff;
+      color: #1d4ed8;
+    }
+    .banner.error {
+      background: #fef2f2;
+      color: var(--danger);
+    }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      .shell { width: min(100vw - 20px, 1120px); margin: 20px auto; }
+      .hero, .panel { border-radius: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <main class=\"shell\">
+    <section class=\"hero\">
+      <div class=\"eyebrow\">Deployed on Marmil</div>
+      <h1>Simple full CRUD application</h1>
+      <p>Create, update, complete, and delete records stored in PostgreSQL through the private backend tier already running behind your Application Load Balancer.</p>
+      <div id=\"status\" class=\"status-row\"></div>
+      <div id=\"message\"></div>
+    </section>
+    <section class=\"layout\">
+      <section class=\"panel\">
+        <h2 class=\"section-title\">Record Editor</h2>
+        <form id=\"item-form\">
+          <input type=\"hidden\" id=\"item-id\" value=\"\">
+          <label>
+            Title
+            <input id=\"title\" type=\"text\" maxlength=\"160\" required placeholder=\"Add a short title\">
+          </label>
+          <label>
+            Details
+            <textarea id=\"details\" maxlength=\"2000\" placeholder=\"Describe the record\"></textarea>
+          </label>
+          <label class=\"check\">
+            <input id=\"is-done\" type=\"checkbox\">
+            Mark as complete
+          </label>
+          <div class=\"actions\">
+            <button class=\"primary\" type=\"submit\" id=\"save-button\">Create record</button>
+            <button class=\"secondary\" type=\"button\" id=\"reset-button\">Reset</button>
+          </div>
+        </form>
+      </section>
+      <section class=\"panel\">
+        <h2 class=\"section-title\">Records</h2>
+        <div id=\"items\" class=\"items\"></div>
+      </section>
+    </section>
+  </main>
+  <script>
+    const statusElement = document.getElementById('status');
+    const messageElement = document.getElementById('message');
+    const itemsElement = document.getElementById('items');
+    const formElement = document.getElementById('item-form');
+    const idElement = document.getElementById('item-id');
+    const titleElement = document.getElementById('title');
+    const detailsElement = document.getElementById('details');
+    const doneElement = document.getElementById('is-done');
+    const saveButtonElement = document.getElementById('save-button');
+    const resetButtonElement = document.getElementById('reset-button');
+
+    function setMessage(kind, text) {
+      if (!text) {
+        messageElement.innerHTML = '';
+        return;
+      }
+      const div = document.createElement('div');
+      div.className = 'banner ' + kind;
+      div.textContent = text;
+      messageElement.innerHTML = '';
+      messageElement.appendChild(div);
+    }
+
+    function setStatus(payload) {
+      const values = [
+        ['Database', payload.db_connectivity_ok],
+        ['Redis', payload.redis_connectivity_ok],
+        ['Ready', payload.ready]
+      ];
+      statusElement.innerHTML = '';
+      values.forEach(function(entry) {
+        const pill = document.createElement('div');
+        pill.className = 'pill';
+        const dot = document.createElement('span');
+        dot.className = 'dot ' + (entry[1] ? 'good' : 'bad');
+        const text = document.createElement('span');
+        text.textContent = entry[0] + ': ' + (entry[1] ? 'healthy' : 'not ready');
+        pill.appendChild(dot);
+        pill.appendChild(text);
+        statusElement.appendChild(pill);
+      });
+    }
+
+    function resetForm() {
+      idElement.value = '';
+      titleElement.value = '';
+      detailsElement.value = '';
+      doneElement.checked = false;
+      saveButtonElement.textContent = 'Create record';
+    }
+
+    function renderItems(items) {
+      itemsElement.innerHTML = '';
+      if (!items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No records yet. Create the first one from the form.';
+        itemsElement.appendChild(empty);
+        return;
+      }
+
+      items.forEach(function(item) {
+        const article = document.createElement('article');
+        article.className = 'item';
+
+        const top = document.createElement('div');
+        top.className = 'item-top';
+
+        const headingWrap = document.createElement('div');
+        const title = document.createElement('h3');
+        title.className = 'item-title';
+        title.textContent = item.title;
+        const meta = document.createElement('div');
+        meta.className = 'item-meta';
+        meta.textContent = 'Record #' + item.id + ' • updated ' + item.updated_at;
+        headingWrap.appendChild(title);
+        headingWrap.appendChild(meta);
+
+        const badge = document.createElement('span');
+        badge.className = 'badge' + (item.is_done ? ' done' : '');
+        badge.textContent = item.is_done ? 'Done' : 'Open';
+
+        top.appendChild(headingWrap);
+        top.appendChild(badge);
+        article.appendChild(top);
+
+        const details = document.createElement('p');
+        details.textContent = item.details || 'No details provided.';
+        article.appendChild(details);
+
+        const actions = document.createElement('div');
+        actions.className = 'actions';
+
+        const editButton = document.createElement('button');
+        editButton.type = 'button';
+        editButton.className = 'secondary';
+        editButton.textContent = 'Edit';
+        editButton.addEventListener('click', function() {
+          idElement.value = String(item.id);
+          titleElement.value = item.title;
+          detailsElement.value = item.details || '';
+          doneElement.checked = item.is_done;
+          saveButtonElement.textContent = 'Update record';
+          titleElement.focus();
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        });
+
+        const deleteButton = document.createElement('button');
+        deleteButton.type = 'button';
+        deleteButton.className = 'danger';
+        deleteButton.textContent = 'Delete';
+        deleteButton.addEventListener('click', async function() {
+          if (!window.confirm('Delete this record?')) {
+            return;
+          }
+          await fetch('/api/items/' + item.id, { method: 'DELETE' });
+          setMessage('info', 'Record deleted.');
+          if (idElement.value === String(item.id)) {
+            resetForm();
+          }
+          await refreshItems();
+        });
+
+        actions.appendChild(editButton);
+        actions.appendChild(deleteButton);
+        article.appendChild(actions);
+        itemsElement.appendChild(article);
+      });
+    }
+
+    async function fetchJson(path, options) {
+      const response = await fetch(path, options || {});
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || 'Request failed');
+      }
+      return payload;
+    }
+
+    async function refreshHealth() {
+      const payload = await fetchJson('/ready');
+      setStatus(payload);
+    }
+
+    async function refreshItems() {
+      const payload = await fetchJson('/api/items');
+      renderItems(payload.items || []);
+    }
+
+    formElement.addEventListener('submit', async function(event) {
+      event.preventDefault();
+      const payload = {
+        title: titleElement.value,
+        details: detailsElement.value,
+        is_done: doneElement.checked
+      };
+      const itemId = idElement.value;
+      const path = itemId ? '/api/items/' + itemId : '/api/items';
+      const method = itemId ? 'PUT' : 'POST';
+      const response = await fetchJson(path, {
+        method: method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      setMessage('info', itemId ? 'Record updated.' : 'Record created.');
+      resetForm();
+      await refreshItems();
+      if (response.item && response.item.id) {
+        console.log('Saved item', response.item.id);
+      }
+    });
+
+    resetButtonElement.addEventListener('click', function() {
+      resetForm();
+      setMessage('', '');
+    });
+
+    async function boot() {
+      try {
+        await refreshHealth();
+        await refreshItems();
+      } catch (error) {
+        setMessage('error', error.message);
+      }
+    }
+
+    window.setInterval(function() {
+      refreshHealth().catch(function(error) {
+        setMessage('error', error.message);
+      });
+    }, 15000);
+
+    boot();
+  </script>
+</body>
+</html>
+"""
+
+
+def _recv_exact(connection, size):
+    buffer = bytearray()
+    while len(buffer) < size:
+        chunk = connection.recv(size - len(buffer))
+        if not chunk:
+            raise RuntimeError("Connection closed unexpectedly")
+        buffer.extend(chunk)
+    return bytes(buffer)
+
+
+def _recv_pg_message(connection):
+    message_type = _recv_exact(connection, 1)
+    message_length = int.from_bytes(_recv_exact(connection, 4), "big")
+    payload = _recv_exact(connection, message_length - 4)
+    return message_type.decode("ascii"), payload
+
+
+def _decode_pg_error(payload):
+    fields = payload.split(b"\x00")
+    details = []
+    for field in fields:
+        if len(field) > 1:
+            details.append(field[1:].decode("utf-8", errors="replace"))
+    return "; ".join(details) or "Unknown PostgreSQL error"
+
+
+def _send_pg_startup(connection, user, database):
+    parameters = (
+        b"user\x00" + user.encode("utf-8") + b"\x00"
+        + b"database\x00" + database.encode("utf-8") + b"\x00"
+        + b"client_encoding\x00UTF8\x00"
+        + b"\x00"
+    )
+    protocol_version = 196608
+    packet_length = 4 + 4 + len(parameters)
+    packet = packet_length.to_bytes(4, "big") + protocol_version.to_bytes(4, "big") + parameters
+    connection.sendall(packet)
+
+
+def _send_pg_password_message(connection, payload_bytes):
+    packet_length = 4 + len(payload_bytes)
+    connection.sendall(b"p" + packet_length.to_bytes(4, "big") + payload_bytes)
+
+
+def _send_pg_query(connection, query_text):
+    encoded = query_text.encode("utf-8") + b"\x00"
+    connection.sendall(b"Q" + (len(encoded) + 4).to_bytes(4, "big") + encoded)
+
+
+def _send_pg_ssl_request(connection):
+    ssl_request_code = 80877103
+    connection.sendall((8).to_bytes(4, "big") + ssl_request_code.to_bytes(4, "big"))
+
+
+def _wrap_postgres_tls(raw_connection):
+    _send_pg_ssl_request(raw_connection)
+    ssl_response = _recv_exact(raw_connection, 1)
+    if ssl_response != b"S":
+        raise RuntimeError("PostgreSQL server did not accept an SSL/TLS connection")
+
+    if DB_TLS_VERIFY:
+        context = ssl.create_default_context()
+    else:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+    wrapped = context.wrap_socket(raw_connection, server_hostname=DB_HOST)
+    wrapped.settimeout(5)
+    return wrapped
+
+
+def _parse_scram_attributes(message):
+    attributes = {}
+    for segment in message.split(","):
+        if "=" not in segment:
+            continue
+        key, value = segment.split("=", 1)
+        attributes[key] = value
+    return attributes
+
+
+def _scram_initial_message(username):
+    nonce = b64encode(os.urandom(18)).decode("ascii").rstrip("=")
+    safe_username = username.replace("=", "=3D").replace(",", "=2C")
+    client_first_bare = f"n={safe_username},r={nonce}"
+    client_first_message = f"n,,{client_first_bare}"
+    client_first_message_bytes = client_first_message.encode("utf-8")
+    initial_payload = (
+        b"SCRAM-SHA-256\x00"
+        + len(client_first_message_bytes).to_bytes(4, "big")
+        + client_first_message_bytes
+    )
+    return nonce, client_first_bare, initial_payload
+
+
+def _scram_client_proof(password, nonce, client_first_bare, server_first_message):
+    attributes = _parse_scram_attributes(server_first_message)
+    server_nonce = attributes["r"]
+    if not server_nonce.startswith(nonce):
+        raise RuntimeError("PostgreSQL SCRAM server nonce did not extend the client nonce")
+
+    salt = b64decode(attributes["s"])
+    iterations = int(attributes["i"])
+    salted_password = pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    client_key = hmac_new(salted_password, b"Client Key", sha256).digest()
+    stored_key = sha256(client_key).digest()
+    client_final_without_proof = f"c=biws,r={server_nonce}"
+    auth_message = ",".join([client_first_bare, server_first_message, client_final_without_proof]).encode("utf-8")
+    client_signature = hmac_new(stored_key, auth_message, sha256).digest()
+    client_proof = bytes(left ^ right for left, right in zip(client_key, client_signature))
+    proof = b64encode(client_proof).decode("ascii")
+    return f"{client_final_without_proof},p={proof}".encode("utf-8")
+
+
+def _open_postgres_connection(password):
+    raw_connection = socket.create_connection((DB_HOST, DB_PORT), timeout=5)
+    try:
+        connection = _wrap_postgres_tls(raw_connection)
+    except Exception:
+        raw_connection.close()
+        raise
+
+    try:
+        _send_pg_startup(connection, DB_USERNAME, DB_NAME)
+        password_used = False
+
+        while True:
+            message_type, payload = _recv_pg_message(connection)
+
+            if message_type == "R":
+                auth_code = int.from_bytes(payload[:4], "big")
+                if auth_code == 0:
+                    continue
+                if auth_code == 3:
+                    _send_pg_password_message(connection, password.encode("utf-8") + b"\x00")
+                    password_used = True
+                    continue
+                if auth_code == 10:
+                    mechanisms = [item.decode("utf-8") for item in payload[4:].split(b"\x00") if item]
+                    if "SCRAM-SHA-256" not in mechanisms:
+                        raise RuntimeError(f"Unsupported PostgreSQL SASL mechanisms: {mechanisms}")
+                    nonce, client_first_bare, initial_payload = _scram_initial_message(DB_USERNAME)
+                    _send_pg_password_message(connection, initial_payload)
+                    server_type, server_payload = _recv_pg_message(connection)
+                    if server_type != "R" or int.from_bytes(server_payload[:4], "big") != 11:
+                        raise RuntimeError("Expected PostgreSQL SASL continue message")
+                    server_first_message = server_payload[4:].decode("utf-8")
+                    client_final = _scram_client_proof(password, nonce, client_first_bare, server_first_message)
+                    _send_pg_password_message(connection, client_final)
+                    password_used = True
+                    continue
+                if auth_code == 11:
+                    raise RuntimeError("Unexpected PostgreSQL SASL continue message")
+                if auth_code == 12:
+                    continue
+                raise RuntimeError(f"Unsupported PostgreSQL authentication code: {auth_code}")
+
+            if message_type in ("S", "K"):
+                continue
+
+            if message_type == "Z":
+                if not password_used:
+                    raise RuntimeError("PostgreSQL connection reached ready state without password authentication")
+                return connection
+
+            if message_type == "E":
+                raise RuntimeError(_decode_pg_error(payload))
+    except Exception:
+        connection.close()
+        raise
+
+
+def _read_cstring(payload, index):
+    end_index = payload.index(b"\x00", index)
+    return payload[index:end_index].decode("utf-8"), end_index + 1
+
+
+def _parse_row_description(payload):
+    field_count = int.from_bytes(payload[:2], "big")
+    index = 2
+    columns = []
+    for _ in range(field_count):
+        name, index = _read_cstring(payload, index)
+        columns.append(name)
+        index += 18
+    return columns
+
+
+def _parse_data_row(payload):
+    value_count = int.from_bytes(payload[:2], "big")
+    index = 2
+    values = []
+    for _ in range(value_count):
+        value_length = int.from_bytes(payload[index:index + 4], "big", signed=True)
+        index += 4
+        if value_length == -1:
+            values.append(None)
+            continue
+        value = payload[index:index + value_length].decode("utf-8")
+        values.append(value)
+        index += value_length
+    return values
+
+
+def execute_postgres_query(password, query_text):
+    with _open_postgres_connection(password) as connection:
+        _send_pg_query(connection, query_text)
+        columns = []
+        rows = []
+        command_tag = ""
+
+        while True:
+            message_type, payload = _recv_pg_message(connection)
+            if message_type == "T":
+                columns = _parse_row_description(payload)
+                continue
+            if message_type == "D":
+                rows.append(_parse_data_row(payload))
+                continue
+            if message_type == "C":
+                command_tag = payload[:-1].decode("utf-8", errors="replace")
+                continue
+            if message_type in ("S", "K", "N", "I"):
+                continue
+            if message_type == "Z":
+                return {
+                    "columns": columns,
+                    "rows": [dict(zip(columns, row)) for row in rows],
+                    "command": command_tag,
+                }
+            if message_type == "E":
+                raise RuntimeError(_decode_pg_error(payload))
+
+
+def _send_resp_command(connection, *parts):
+    frame = [f"*{len(parts)}\r\n".encode("ascii")]
+    for part in parts:
+        encoded = str(part).encode("utf-8")
+        frame.append(f"$${len(encoded)}\r\n".encode("ascii"))
+        frame.append(encoded + b"\r\n")
+    connection.sendall(b"".join(frame))
+
+
+def _read_resp_line(connection):
+    buffer = bytearray()
+    while not buffer.endswith(b"\r\n"):
+        chunk = connection.recv(1)
+        if not chunk:
+            raise RuntimeError("Redis connection closed unexpectedly")
+        buffer.extend(chunk)
+    return bytes(buffer[:-2])
+
+
+def check_redis_connection(auth_token):
+    if not REDIS_HOST:
+        return False
+
+    with socket.create_connection((REDIS_HOST, REDIS_PORT), timeout=5) as raw_connection:
+        connection = raw_connection
+        if REDIS_TLS_ENABLED:
+            context = ssl.create_default_context()
+            connection = context.wrap_socket(raw_connection, server_hostname=REDIS_HOST)
+
+        with connection:
+            if auth_token:
+                _send_resp_command(connection, "AUTH", auth_token)
+                response = _read_resp_line(connection)
+                if not response.startswith(b"+OK"):
+                    raise RuntimeError(f"Redis AUTH failed: {response.decode('utf-8', errors='replace')}")
+
+            _send_resp_command(connection, "PING")
+            response = _read_resp_line(connection)
+            if response != b"+PONG":
+                raise RuntimeError(f"Redis PING failed: {response.decode('utf-8', errors='replace')}")
+            return True
+
+
+def aws_cli_json(*args):
+    command = ["aws", "--region", AWS_REGION, *args]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "aws cli command failed"
+        raise RuntimeError(f"{' '.join(command)}: {message}")
+    return json.loads(result.stdout)
+
+
+def read_secret(secret_arn):
+    payload = aws_cli_json("secretsmanager", "get-secret-value", "--secret-id", secret_arn, "--output", "json")
+    secret_text = payload.get("SecretString", "")
+    if not secret_text:
+        raise RuntimeError(f"Secret {secret_arn} does not contain SecretString")
+    try:
+        secret_value = json.loads(secret_text)
+    except json.JSONDecodeError:
+        return {"value": secret_text}
+    if isinstance(secret_value, dict):
+        return secret_value
+    return {"value": secret_text}
+
+
+def _sql_literal(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    escaped = str(value).replace("'", "''")
+    return "'" + escaped + "'"
+
+
+def _normalize_item_payload(payload):
+    title = (payload.get("title") or "").strip()
+    if not title:
+        raise ValueError("title is required")
+    if len(title) > 160:
+        raise ValueError("title must be 160 characters or fewer")
+
+    details = (payload.get("details") or "").strip()
+    if len(details) > MAX_TEXT_LENGTH:
+        raise ValueError("details must be 2000 characters or fewer")
+
+    is_done = bool(payload.get("is_done", False))
+    return {
+        "title": title,
+        "details": details,
+        "is_done": is_done,
+    }
+
+
+def _serialize_item(row):
+    return {
+        "id": int(row["id"]),
+        "title": row["title"] or "",
+        "details": row["details"] or "",
+        "is_done": row["is_done"] == "t",
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _get_db_password():
+    with STATE_LOCK:
+        return STATE["db_password"]
+
+
+def ensure_application_schema(password):
+    execute_postgres_query(
+        password,
+        """
+        CREATE TABLE IF NOT EXISTS app_items (
+            id BIGSERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            details TEXT NOT NULL DEFAULT '',
+            is_done BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """,
+    )
+
+
+def list_items(password):
+    result = execute_postgres_query(
+        password,
+        "SELECT id, title, details, is_done, created_at::text, updated_at::text FROM app_items ORDER BY id DESC;",
+    )
+    return [_serialize_item(row) for row in result["rows"]]
+
+
+def get_item(password, item_id):
+    result = execute_postgres_query(
+        password,
+        "SELECT id, title, details, is_done, created_at::text, updated_at::text FROM app_items WHERE id = " + str(item_id) + ";",
+    )
+    if not result["rows"]:
+        return None
+    return _serialize_item(result["rows"][0])
+
+
+def create_item(password, payload):
+    item = _normalize_item_payload(payload)
+    query_text = (
+        "INSERT INTO app_items (title, details, is_done) VALUES ("
+        + _sql_literal(item["title"])
+        + ", "
+        + _sql_literal(item["details"])
+        + ", "
+        + _sql_literal(item["is_done"])
+        + ") RETURNING id, title, details, is_done, created_at::text, updated_at::text;"
+    )
+    result = execute_postgres_query(
+        password,
+        query_text,
+    )
+    return _serialize_item(result["rows"][0])
+
+
+def update_item(password, item_id, payload):
+    item = _normalize_item_payload(payload)
+    query_text = (
+        "UPDATE app_items SET title = "
+        + _sql_literal(item["title"])
+        + ", details = "
+        + _sql_literal(item["details"])
+        + ", is_done = "
+        + _sql_literal(item["is_done"])
+        + ", updated_at = NOW() WHERE id = "
+        + str(item_id)
+        + " RETURNING id, title, details, is_done, created_at::text, updated_at::text;"
+    )
+    result = execute_postgres_query(
+        password,
+    query_text,
+    )
+    if not result["rows"]:
+        return None
+    return _serialize_item(result["rows"][0])
+
+
+def delete_item(password, item_id):
+    result = execute_postgres_query(
+        password,
+        "DELETE FROM app_items WHERE id = " + str(item_id) + " RETURNING id;",
+    )
+    return bool(result["rows"])
+
+
+def refresh_runtime_secrets():
+    db_secret = read_secret(DB_SECRET_ARN)
+    db_password = db_secret.get("password") or db_secret.get("value")
+    if not db_password:
+        raise RuntimeError("Database secret did not include a password field")
+
+    ensure_application_schema(db_password)
+
+    redis_auth_loaded = False
+    redis_connectivity_ok = False
+    if REDIS_AUTH_TOKEN_SECRET_ARN:
+        redis_secret = read_secret(REDIS_AUTH_TOKEN_SECRET_ARN)
+        redis_token = redis_secret.get("auth_token") or redis_secret.get("value")
+        if not redis_token:
+            raise RuntimeError("Redis auth secret did not include an auth token")
+        redis_auth_loaded = True
+        redis_connectivity_ok = check_redis_connection(redis_token)
+    elif REDIS_HOST:
+        redis_connectivity_ok = check_redis_connection("")
+
+    with STATE_LOCK:
+        STATE["db_password"] = db_password
+        STATE["db_password_loaded"] = True
+        STATE["redis_auth_loaded"] = redis_auth_loaded
+        STATE["db_connectivity_ok"] = True
+        STATE["redis_connectivity_ok"] = redis_connectivity_ok
+        STATE["last_refresh_epoch"] = int(time.time())
+        STATE["last_refresh_error"] = None
+
+    LOGGER.info(
+        "Refreshed runtime dependencies db_loaded=%s db_connected=%s redis_loaded=%s redis_connected=%s",
+        True,
+        True,
+        redis_auth_loaded,
+        redis_connectivity_ok,
+    )
+
+
+def refresh_loop():
+    while True:
+        try:
+            refresh_runtime_secrets()
+        except Exception as exc:
+            LOGGER.exception("Runtime secret refresh failed: %s", exc)
+            with STATE_LOCK:
+                STATE["db_password"] = None
+                STATE["db_password_loaded"] = False
+                STATE["redis_auth_loaded"] = False
+                STATE["db_connectivity_ok"] = False
+                STATE["redis_connectivity_ok"] = False
+                STATE["last_refresh_error"] = str(exc)
+        time.sleep(REFRESH_INTERVAL_SECONDS)
+
+
+def build_status_payload():
+    with STATE_LOCK:
+        return {
+            "app_name": APP_NAME,
+            "instance_id": os.environ.get("INSTANCE_ID"),
+            "db_host": os.environ.get("DB_HOST"),
+            "db_name": os.environ.get("DB_NAME"),
+            "db_password_loaded": STATE["db_password_loaded"],
+            "db_connectivity_ok": STATE["db_connectivity_ok"],
+            "redis_host": os.environ.get("REDIS_HOST"),
+            "redis_tls_enabled": REDIS_TLS_ENABLED,
+            "redis_auth_loaded": STATE["redis_auth_loaded"],
+            "redis_connectivity_ok": STATE["redis_connectivity_ok"],
+            "last_refresh_epoch": STATE["last_refresh_epoch"],
+            "last_refresh_error": STATE["last_refresh_error"],
+        }
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send_json(self, payload, status_code=200):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html_text, status_code=200):
+        body = html_text.encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _parse_json_body(self):
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length else b"{}"
+        try:
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON body: {exc.msg}")
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
+
+    def _require_db_password(self):
+        password = _get_db_password()
+        if not password:
+            raise RuntimeError("application is still waiting for database credentials")
+        return password
+
+    def _item_id_from_path(self, path):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) == 3 and parts[0] == "api" and parts[1] == "items" and parts[2].isdigit():
+            return int(parts[2])
+        return None
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/":
+            self._send_html(APPLICATION_HTML)
+            return
+
+        if parsed.path in ("/health", "/ready"):
+            payload = build_status_payload()
+            status_code = 200
+            if parsed.path == "/ready":
+                ready = payload["db_password_loaded"] and payload["db_connectivity_ok"]
+                if REDIS_HOST:
+                    ready = ready and payload["redis_connectivity_ok"]
+                payload["ready"] = ready
+                status_code = 200 if ready else 503
+            self._send_json(payload, status_code)
+            return
+
+        if parsed.path == "/api/items":
+            try:
+                items = list_items(self._require_db_password())
+                self._send_json({"items": items})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, 503)
+            return
+
+        item_id = self._item_id_from_path(parsed.path)
+        if item_id is not None:
+            try:
+                item = get_item(self._require_db_password(), item_id)
+                if not item:
+                    self._send_json({"error": "not_found"}, 404)
+                    return
+                self._send_json({"item": item})
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, 503)
+            return
+
+        self._send_json({"error": "not_found", "path": parsed.path}, 404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path != "/api/items":
+            self._send_json({"error": "not_found", "path": parsed.path}, 404)
+            return
+        try:
+            payload = self._parse_json_body()
+            item = create_item(self._require_db_password(), payload)
+            self._send_json({"item": item}, 201)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, 400)
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 503)
+
+    def do_PUT(self):
+        parsed = urlparse(self.path)
+        item_id = self._item_id_from_path(parsed.path)
+        if item_id is None:
+            self._send_json({"error": "not_found", "path": parsed.path}, 404)
+            return
+        try:
+            payload = self._parse_json_body()
+            item = update_item(self._require_db_password(), item_id, payload)
+            if not item:
+                self._send_json({"error": "not_found"}, 404)
+                return
+            self._send_json({"item": item})
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, 400)
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 503)
+
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        item_id = self._item_id_from_path(parsed.path)
+        if item_id is None:
+            self._send_json({"error": "not_found", "path": parsed.path}, 404)
+            return
+        try:
+            deleted = delete_item(self._require_db_password(), item_id)
+            if not deleted:
+                self._send_json({"error": "not_found"}, 404)
+                return
+            self._send_json({"deleted": True, "id": item_id})
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 503)
+
+    def log_message(self, fmt, *args):
+        LOGGER.info("%s %s", self.address_string(), fmt % args)
+
+
+if __name__ == "__main__":
+    LOGGER.info("Starting backend server on port %s", APP_PORT)
+    refresh_thread = threading.Thread(target=refresh_loop, name="secret-refresh", daemon=True)
+    refresh_thread.start()
+    ThreadingHTTPServer(("0.0.0.0", APP_PORT), Handler).serve_forever()
